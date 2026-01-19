@@ -243,7 +243,7 @@ def plot_mobility_tensors(coords, kxx, kxy, kyy, L, W, title_prefix='Mobility'):
 
 # -------------------------- path extraction --------------------------
 
-def gradienttrace(gradx_interp,grady_interp,coords,src,dst,xg,yg,steplength=1e-4,
+def gradienttrace(gradx_interp,grady_interp,coords,src,dst,steplength=1e-4,
                              max_steps=7000, initial_angle_deg=10.0):
     """
     Follow continuous -grad(phi) by interpolating phi to a grid. Returns a snapped
@@ -612,7 +612,7 @@ def case_square_with_vertical_conductive_strip(save_prefix=None, show=False, see
 
     dijk_nodes, dijk_time = dijkstra_path(coords, efrom, eto, etime, src, dst)
 
-    greedy_xy = gradienttrace(gradx_interp,grady_interp, coords, src, dst, xg, yg, steplength=steplen)
+    greedy_xy = gradienttrace(gradx_interp,grady_interp, coords, src, dst, steplength=steplen)
     greedy_time = path_time_from_mesh(greedy_xy, conductivity_grid, xg, yg, steplength=steplen)
 
     # greedy_time           = path_time(greedy_nodes, time_map)
