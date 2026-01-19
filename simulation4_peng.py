@@ -454,8 +454,8 @@ def plot_field_with_paths(X,Y,Phi,dPhidx,dPhidy, coords, src, dst,
 
     if greedy_coords is not None and len(greedy_coords)>0:
         plt.plot(greedy_coords[:,0], greedy_coords[:,1], 'r-', lw=0.5, label='Greedy steepest drop')
-    # if dijk_coords is not None and len(dijk_coords)>0:
-    #     plt.plot(dijk_coords[:,0], dijk_coords[:,1], 'y-', lw=0.5, label='Dijkstra shortest time')
+    if dijk_coords is not None and len(dijk_coords)>0:
+        plt.plot(dijk_coords[:,0], dijk_coords[:,1], 'y-', lw=0.5, label='Dijkstra shortest time')
     plt.plot(coords[src,0], coords[src,1], 'go', ms=7, label='Source')
     plt.plot(coords[dst,0], coords[dst,1], 'ro', ms=7, label='Destination')
     ax = plt.gca()
