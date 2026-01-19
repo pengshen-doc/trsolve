@@ -12,7 +12,7 @@ from matplotlib.patches import Rectangle, Circle
 MPH_TO_MPS = 0.44704
 lp0 = 0.005
 RADIUS = 20*lp0
-# -------------------------- general helpers --------------------------
+steplen = 3.86e-4
 
 def nan_gaussian_blur(Z, sigma_pix=0.8):
     """NaN-aware Gaussian blur (for prettier fields)."""
@@ -186,74 +186,6 @@ def solve_with_component_pinning(M, b, pinned_nodes):
         ML.rows[n] = [n]; ML.data[n] = [1.0]; b[n] = 0.0
     return spsolve(ML.tocsr(), b)
 
-#singum tensors and flows
-
-def singum_tensor_per_node(coords, efrom, eto, K_edge, lattice, lp0, use_hex_iso=False):
-    """
-    Compute per-node singum mobility tensor k = (2 lp^2 / V_s) sum_e K (n n^T),
-    where lp = edge_length/2, V_s hex = 2*sqrt(3)*lp0^2, square = 4*lp0^2.
-    For hex lattices, can optionally override with isotropic k_ij = (sqrt(3)/2)*K δ_ij.
-    """
-    N = coords.shape[0]
-    kxx = np.zeros(N); kxy = np.zeros(N); kyy = np.zeros(N)
-    V_s = 2*np.sqrt(3)*lp0**2 if lattice=='hex' else 4*lp0**2
-
-    if lattice == 'hex' and use_hex_iso:
-        Kbar = float(np.mean(K_edge))
-        k_iso = 0.5 * np.sqrt(3.0) * Kbar
-        kxx[:] = k_iso; kyy[:] = k_iso
-        return kxx, kxy, kyy
-
-    for u,v,K in zip(efrom, eto, K_edge):
-        d = coords[v]-coords[u]
-        elen = np.linalg.norm(d)
-        if elen<=0: continue
-        nvec = d/elen
-        lp = 0.5*elen
-        factor = (2*lp*lp*K)/V_s  # derived from paper
-        # contribute to node u (outward direction from u to v)
-        kxx[u] += factor * (nvec[0]*nvec[0])
-        kxy[u] += factor * (nvec[0]*nvec[1])
-        kyy[u] += factor * (nvec[1]*nvec[1])
-        # and node v (outward from v to u is -n)
-        kxx[v] += factor * (nvec[0]*nvec[0])
-        kxy[v] += factor * (nvec[0]*nvec[1])
-        kyy[v] += factor * (nvec[1]*nvec[1])
-
-    return kxx, kxy, kyy
-
-
-def singum_flow_per_node(coords, phi, efrom, eto, time_map, lattice, lp0):
-    """
-    q = (1/V_s) sum_e x^I Q_e, with x^I = lp n (vector from node to cutpoint),
-    Q_e = G_e (phi_u - phi_v), G_e = 1/t_e.
-    """
-    N = coords.shape[0]
-    qx = np.zeros(N); qy = np.zeros(N)
-    V_s = 2*np.sqrt(3)*lp0**2 if lattice=='hex' else 4*lp0**2
-
-    for u,v in zip(efrom, eto):
-        p0, p1 = coords[u], coords[v]
-        d = p1-p0
-        elen = np.linalg.norm(d)
-        if elen<=0: continue
-        nvec = d/elen
-        lp = 0.5*elen
-        G = 1.0 / time_map[(u,v)]
-        Iuv = G*(phi[u]-phi[v])  # flow from u to v positive if phi[u]>phi[v]
-        # contribution to node u: outward direction +n
-        xI = lp*nvec
-        qx[u] += xI[0]*Iuv
-        qy[u] += xI[1]*Iuv
-        # contribution to node v: outward direction -n, flow from v to u is -Iuv
-        # So xI*(-Iuv) with xI = lp*(-n) -> identical sign as u side:
-        qx[v] += xI[0]*Iuv
-        qy[v] += xI[1]*Iuv
-
-    qx /= V_s; qy /= V_s
-    return qx, qy
-
-
 # ---------- sizing helpers: 15–20 in x, ~10 in y ----------
 def lp0_for_square(L, W, nx_segments=18, ny_segments=10):
     # square grid has spacing dx = 2*lp0; nx-1 = L/dx ≈ nx_segments
@@ -311,262 +243,17 @@ def plot_mobility_tensors(coords, kxx, kxy, kyy, L, W, title_prefix='Mobility'):
 
 # -------------------------- path extraction --------------------------
 
-def greedy_path_on_nodes(phi, efrom, eto, src, dst=None, goal_set=None, coords=None, choice=1,max_steps=500000):
-    """
-    Greedy steepest-drop path on node potentials with robust handling of Dirichlet plateaus.
-    - src: int or iterable of start nodes (e.g., all nodes in a source disk)
-    - dst: optional single goal node
-    - goal_set: optional set of goal nodes (e.g., all nodes in a sink disk). If provided, overrides dst.
-    - coords: optional (N,2) array for distance-based tie-breaking / plateau creep
-    """
-    from collections import defaultdict, deque
-    nbrs = defaultdict(list)
-    for u, v in zip(efrom, eto):
-        nbrs[u].append(v); nbrs[v].append(u)
-
-    N = len(phi)
-    tol = 1e-13
-
-    # Normalize inputs
-    if goal_set is None:
-        goal_set = set()
-        if dst is not None:
-            goal_set.add(int(dst))
-
-    # Choose a start node.
-    def pick_start_from_set(S):
-        S = list(S)
-        # 1) Prefer boundary nodes: have at least one neighbor with strictly lower phi
-        boundary = [u for u in S if any(phi[v] < phi[u] - tol for v in nbrs[u])]
-        if boundary:
-            if coords is not None and goal_set:
-                # choose boundary node closest to any goal (approx: closest to the first goal)
-                g = next(iter(goal_set))
-                return min(boundary, key=lambda k: np.linalg.norm(coords[k] - coords[g]))
-            return boundary[0]
-        # 2) Plateau crawl: BFS within equal-phi set to find a node touching lower phi
-        seen = set(S)
-        dq = deque(S)
-        while dq:
-            u = dq.popleft()
-            if any(phi[v] < phi[u] - tol for v in nbrs[u]):
-                return u
-            for v in nbrs[u]:
-                if v not in seen and abs(phi[v] - phi[u]) <= tol:
-                    seen.add(v); dq.append(v)
-        # 3) Fallback: just pick the member of S closest to the goal (or the first)
-        if coords is not None and goal_set:
-            g = next(iter(goal_set))
-            return min(S, key=lambda k: np.linalg.norm(coords[k] - coords[g]))
-        return S[0] if S else None
-
-    if isinstance(src, (list, tuple, set, np.ndarray)):
-        cur = pick_start_from_set(src)
-    else:
-        cur = int(src)
-
-    if cur is None:
-        return []
-
-    # Walk
-    path = [cur]
-    visited = {cur}
-
-    def reached_goal(u):
-        return (u in goal_set) if goal_set else (u == dst)
-
-    # distance helper for tie-breaking
-    def dist_to_goal(u):
-        if coords is None or not goal_set:
-            return 0.0
-        # nearest goal
-        return min(np.linalg.norm(coords[u] - coords[g]) for g in goal_set)
-
-    steps = 0
-    eps = 1e-14
-    while not reached_goal(cur) and steps < max_steps:
-        steps += 1
-        nlist = nbrs[cur]
-        # Strictly descending neighbors
-        lower = [v for v in nlist if phi[v] < phi[cur]]
-        if lower:
-            # pick with minimum phi; tie-break by distance to goal if available
-            best_phi = min(phi[v] for v in lower)
-            candidates = [v for v in lower if abs(phi[v] - best_phi) <= tol]
-            if len(candidates) > 1:
-                #nxt = min(candidates, key=dist_to_goal)
-                nxt = min(candidates, key=dist_to_goal)
-                
-                print("found a case here: ", len(candidates))
-                #exit()
-            else:
-                nxt = candidates[0]
-        else:
-            # print("equal phi neighbor", steps, max_steps)
-            # Plateau creep: move to equal-phi neighbor that gets closer to goal
-            equal = [v for v in nlist if abs(phi[v] - phi[cur]) <= tol]
-            if not equal:
-                break
-            # choose the equal-phi neighbor that minimizes distance to goal (if available)
-            # if (steps > 5):
-            #     nxt = max(equal, key=dist_to_goal) 
-            # else:
-            #     nxt = min(equal, key=dist_to_goal) 
-            
-            #max(equal,key=dist_to_goal)
-            print("steps = ",steps)
-            # equal_sorted = sorted(equal, key=dist_to_goal)  # ascending (min to max)
-            # nxt = equal_sorted[1]
-
-            equal_sorted = sorted(equal, key=dist_to_goal)
-            if steps==1:
-                nxt = equal_sorted[1]
-          
-            elif steps==2:
-                nxt = equal_sorted[1]
-
-            elif steps==3:
-                nxt = equal_sorted[1]
-
-            elif steps==4:
-                nxt = equal_sorted[1]
-            
-            elif steps==5:
-                nxt = equal_sorted[1]
-
-            elif steps==6:
-                nxt = equal_sorted[1]
-            
-            elif steps==7:
-                nxt = equal_sorted[1]
-
-            elif steps==8:
-                nxt = equal_sorted[2]
-
-            else:
-                nxt = equal_sorted[0]
-
-            # if steps==5:
-            #     equal_sorted = sorted(equal, key=dist_to_goal)  # ascending (min to max)
-            #     nxt = equal_sorted[2]
-
-            # if steps==6:
-            #     equal_sorted = sorted(equal, key=dist_to_goal)  # ascending (min to max)
-            #     nxt = equal_sorted[2]
-
-            # else:
-            #     nxt = min(equal, key=dist_to_goal)
-
-            
-
-            # avoid trivial back-and-forth
-            if len(path) >= 2 and nxt == path[-2]:
-                # pick next best equal neighbor if possible
-                eq_sorted = sorted(equal, key=dist_to_goal)
-                for cand in eq_sorted:
-                    if cand != path[-2]:
-                        nxt = cand; break
-
-        if nxt in visited and nxt != path[-2] if len(path) >= 2 else False:
-            print("exit here at step ", steps)
-            # We're looping on a plateau: stop
-            break
-
-        path.append(nxt)
-        visited.add(nxt)
-        cur = nxt
-    print("total steps = ", steps)
-    return path
-
-
-def plateau_bfs_path(phi, efrom, eto, src, dst=None, goal_set=None, coords=None, max_steps=500000):
-    """
-    Plateau-aware BFS: flood equal-phi components, then expand to strictly lower
-    neighbors. Never steps uphill; returns empty list if no goal is reachable.
-    """
-    from collections import defaultdict, deque
-    nbrs = defaultdict(list)
-    for u, v in zip(efrom, eto):
-        nbrs[u].append(v); nbrs[v].append(u)
-
-    tol = 1e-12
-
-    if goal_set is None:
-        goal_set = set()
-        if dst is not None:
-            goal_set.add(int(dst))
-
-    if isinstance(src, (list, tuple, set, np.ndarray)):
-        src = int(next(iter(src)))
-    else:
-        src = int(src)
-
-    def reached_goal(u):
-        return (u in goal_set) if goal_set else (u == dst)
-
-    def dist_to_goal(u):
-        if coords is None or not goal_set:
-            return 0.0
-        return min(np.linalg.norm(coords[u] - coords[g]) for g in goal_set)
-
-    parent = {src: None}
-    q = deque([src])
-    found = None
-    steps = 0
-
-    while q and steps < max_steps:
-        u = q.popleft()
-        if reached_goal(u):
-            found = u
-            break
-        steps += 1
-
-        equal = [v for v in nbrs[u] if abs(phi[v] - phi[u]) <= tol]
-        for v in equal:
-            if v not in parent:
-                parent[v] = u
-                q.append(v)
-
-        lower = [v for v in nbrs[u] if phi[v] < phi[u] - tol]
-        lower.sort(key=lambda v: (phi[v], dist_to_goal(v)))
-        for v in lower:
-            if v not in parent:
-                parent[v] = u
-                q.append(v)
-
-    if found is None:
-        return []
-
-    path = []
-    cur = found
-    while cur is not None:
-        path.append(cur)
-        cur = parent[cur]
-    return path[::-1]
-
-
-def continuous_gradient_path(phi, coords, src, dst, ngx=260, ngy=260, step_frac=0.10, max_steps=5000, initial_angle_deg=350.0):
+def gradienttrace(gradx_interp,grady_interp,coords,src,dst,xg,yg,steplength=1e-4,
+                             max_steps=7000, initial_angle_deg=10.0):
     """
     Follow continuous -grad(phi) by interpolating phi to a grid. Returns a snapped
     node path and the continuous polyline (Nx2).
     """
-    # Grid for interpolation
     x_min, x_max = float(coords[:, 0].min()), float(coords[:, 0].max())
     y_min, y_max = float(coords[:, 1].min()), float(coords[:, 1].max())
-    xg = np.linspace(x_min, x_max, int(ngx))
-    yg = np.linspace(y_min, y_max, int(ngy))
-    X, Y = np.meshgrid(xg, yg)
-    Phi = griddata(coords, phi, (X, Y), method='linear')
-    Phi = nan_gaussian_blur(Phi, 0.8)
-    dPhidy, dPhidx = np.gradient(Phi, yg[1]-yg[0], xg[1]-xg[0], edge_order=2)
-
-    gradx_interp = RegularGridInterpolator((yg, xg), dPhidx, bounds_error=False, fill_value=0.0)
-    grady_interp = RegularGridInterpolator((yg, xg), dPhidy, bounds_error=False, fill_value=0.0)
 
     pt = coords[int(src)].astype(float)
     goal = coords[int(dst)].astype(float)
-    spacing = step_frac * min(xg[1]-xg[0], yg[1]-yg[0])
-
     path_xy = [pt.copy()]
 
     # First step: bias toward goal, optionally rotated
@@ -592,54 +279,43 @@ def continuous_gradient_path(phi, coords, src, dst, ngx=260, ngy=260, step_frac=
                 step_dir = dir_goal
         else:
             step_dir = dir_goal
-        #print("pt=",pt,"path=",path_xy,'gx,gy:',gx0,gy0,"gnrm:",gnrm,"step_dir=",step_dir)
-        pt = pt + spacing * step_dir
+        pt = pt + steplength * step_dir
         pt[0] = np.clip(pt[0], x_min, x_max)
         pt[1] = np.clip(pt[1], y_min, y_max)
         path_xy.append(pt.copy())
-        #print("new location")
-        #print("path_xy:",path_xy)
 
     for index in range(int(max_steps)):
         gx = gradx_interp((pt[1], pt[0]))
         gy = grady_interp((pt[1], pt[0]))
         if not np.isfinite(gx) or not np.isfinite(gy):
+            print("non-finite gradient, stopping")
             break
         gvec = np.array([gx, gy], float)
         gnrm = np.linalg.norm(gvec)
         gn = 0*gvec
         if gnrm < 1e-6:
             dirgoal = (goal - pt) / np.linalg.norm(goal - pt)
-            step = spacing*dirgoal
+            step = steplength*dirgoal
+            print("near zero grad, heading to goal")
+            exit()
         else:
             gn = gvec/gnrm
-            step = -spacing * gn
+            step = -steplength * gn
         pt = pt + step
         pt[0] = np.clip(pt[0], x_min, x_max)
         pt[1] = np.clip(pt[1], y_min, y_max)
-
         path_xy.append(pt.copy())
+        print("index = ", index, "loc = ", pt," grd = ", gn,"gnrm =", gnrm)
 
-        if (index <=900):
-            print("index = ", index, "location = ", pt," gradient = ", gn)
-            #print("path_xy:",path_xy)
-            #print("gn:",gn)
-        else:
-            break
-
-        if np.linalg.norm(pt - goal) <= spacing:
+        # if (index <=3900):
+        #     print("index = ", index, "loc = ", pt," grd = ", gn,"gnrm =", gnrm)
+        # else:
+        #     break
+        condition_to_goal = np.abs(pt[0]-goal[0])<=steplength and np.linalg.norm(pt-goal)<=1000*steplength
+        if condition_to_goal:
             path_xy.append(goal.copy())
-            break
-
-    # Snap to nearest nodes
-    node_path = []
-    for p in path_xy:
-        idx = nearest_node(coords, p)
-        if not node_path or node_path[-1] != idx:
-            node_path.append(idx)
-
-    return node_path, np.vstack(path_xy) if path_xy else np.zeros((0, 2))
-
+            break 
+    return np.vstack(path_xy) if path_xy else np.zeros((0, 2))
 
 def dijkstra_path(coords, efrom, eto, etime, src, dst):
     rows = np.concatenate([efrom, eto])
@@ -657,20 +333,96 @@ def dijkstra_path(coords, efrom, eto, etime, src, dst):
     return path, float(dist[dst])
 
 def path_time(path, time_map):
-    if len(path)<2: return np.nan
+    if len(path)<2:
+        print("path_time: path too short")
+        return np.nan
     tt=0.0
-    for a,b in zip(path[:-1], path[1:]):
+    #for a,b in zip(path[:-1], path[1:]):
+    for i, (a, b) in enumerate(zip(path[:-1], path[1:]), start=1):
         t = time_map.get((a,b)) or time_map.get((b,a))
-        if t is None: return np.nan
+        if t is None:
+            print("path_time: missing edge time for ", a, b, i, len(path))
+            return np.nan
         tt+=t
     return tt
 
-def path_overlap(a,b):
-    def edgeset(p): return set((min(u,v),max(u,v)) for u,v in zip(p[:-1],p[1:]))
-    Ea = edgeset(a); Eb = edgeset(b)
-    if not Ea and not Eb: return 1.0
-    if not Ea or not Eb:  return 0.0
-    return len(Ea & Eb) / len(Ea | Eb)
+def path_time_from_mesh(path_coords, conductivity_grid, xg, yg, steplength=1e-4):
+    """
+    Compute travel time along a path using interpolated conductivity from a mesh grid.
+    Integrates in substeps of steplength to handle spatially-varying conductivity.
+    
+    Args:
+        path_coords: Nx2 array of (x, y) coordinates defining the path
+        conductivity_grid: 2D mesh grid of conductivity values (inverse of time per unit length)
+        xg: x-axis grid coordinates
+        yg: y-axis grid coordinates
+        steplength: step size for integration along path segments
+    
+    Returns:
+        Total travel time along the path (sum of segment times)
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    
+    if len(path_coords) < 2:
+        print("path_time_from_mesh: path too short")
+        return np.nan
+    
+    # Create interpolator for conductivity mesh
+    # Note: conductivity_grid is indexed as [y, x] so we reverse xg, yg order
+    cond_interp = RegularGridInterpolator((yg, xg), conductivity_grid, 
+                                          bounds_error=False, fill_value=0.0)
+    total_time = 0.0
+    # Sum travel time over each path segment, integrating in steplength increments
+    for i in range(len(path_coords) - 1):
+        p_start = path_coords[i]
+        p_end = path_coords[i + 1]
+        segment_length = np.linalg.norm(p_end - p_start)
+        if segment_length < 1e-12:
+            continue
+        # Number of substeps along this segment
+        n_substeps = max(1, int(np.ceil(segment_length / steplength)))
+        substep_length = segment_length / n_substeps
+        # Integrate over substeps
+        for j in range(n_substeps):
+            # Position along segment (midpoint of substep)
+            t_frac = (j + 0.5) / n_substeps
+            pos = p_start + t_frac * (p_end - p_start)
+            # Interpolate conductivity at this position
+            # RegularGridInterpolator expects (y, x) order
+            cond_value = cond_interp((pos[1], pos[0]))
+            if not np.isfinite(cond_value) or cond_value <= 0:
+                print(f"path_time_from_mesh: non-finite conductivity at segment {i}, substep {j}")
+                return np.nan
+            # Time = distance / speed, where speed ~ conductivity
+            # Add time for this substep
+            total_time += substep_length / cond_value
+    return total_time
+
+def time_map_to_conductivity_mesh(time_map, coords, efrom, eto, xg, yg):
+    """
+    Convert edge-based time_map to a continuous conductivity mesh grid.
+    
+    Args:
+        time_map: Dictionary mapping (u,v) edges to travel times
+        coords: Node coordinates (Nx2)
+        efrom, eto: Edge connectivity arrays
+        xg: x-axis grid coordinates
+        yg: y-axis grid coordinates
+    
+    Returns:
+        conductivity_grid: 2D mesh of conductivity values (1/time)
+    """
+    # Extract edge midpoints and conductivity values
+    edge_midpts = 0.5 * (coords[efrom] + coords[eto])
+    edge_times = np.array([time_map[(u, v)] for u, v in zip(efrom, eto)])
+    edge_len = np.array([np.linalg.norm(coords[u] - coords[v]) for u, v in zip(efrom, eto)])
+    edge_conductivity = edge_len / np.maximum(edge_times, 1e-12)
+    # Create mesh grid and interpolate
+    X, Y = np.meshgrid(xg, yg)
+    conductivity_grid = griddata(edge_midpts, edge_conductivity, (X, Y), method='nearest')
+    # Smooth with NaN-aware blur
+    #conductivity_grid = nan_gaussian_blur(conductivity_grid, 0.8)
+    return conductivity_grid
 
 # -------------------------- plotting --------------------------
 
@@ -701,9 +453,9 @@ def plot_field_with_paths(X,Y,Phi,dPhidx,dPhidy, coords, src, dst,
                        scale=20, width=0.0035, alpha=0.7, minlength=0.1)
 
     if greedy_coords is not None and len(greedy_coords)>0:
-        plt.plot(greedy_coords[:,0], greedy_coords[:,1], 'c-', lw=3, label='Greedy steepest drop')
-    if dijk_coords is not None and len(dijk_coords)>0:
-        plt.plot(dijk_coords[:,0], dijk_coords[:,1], 'm-', lw=3, label='Dijkstra shortest time')
+        plt.plot(greedy_coords[:,0], greedy_coords[:,1], 'r-', lw=0.5, label='Greedy steepest drop')
+    # if dijk_coords is not None and len(dijk_coords)>0:
+    #     plt.plot(dijk_coords[:,0], dijk_coords[:,1], 'y-', lw=0.5, label='Dijkstra shortest time')
     plt.plot(coords[src,0], coords[src,1], 'go', ms=7, label='Source')
     plt.plot(coords[dst,0], coords[dst,1], 'ro', ms=7, label='Destination')
     ax = plt.gca()
@@ -712,28 +464,19 @@ def plot_field_with_paths(X,Y,Phi,dPhidx,dPhidy, coords, src, dst,
             ax.add_patch(Circle((cx,cy), R, fill=False, ec=col, lw=2.0, label=lab))
     if hole_rect is not None:
         cx,cy,w,h = hole_rect
-        ax.add_patch(Rectangle((cx-w/2, cy-h/2), w,h, fill=False, ec='w', lw=2.0, ls='--', label='Hole'))
+        ax.add_patch(Rectangle((cx-w/2, cy-h/2), w,h, fill=False, ec='w', lw=0.5, ls='--', label='Hole'))
     if crack_seg is not None:
         a,b = np.asarray(crack_seg[0]).ravel()[:2], np.asarray(crack_seg[1]).ravel()[:2]
-        plt.plot([a[0],b[0]],[a[1],b[1]], 'w--', lw=2.5, label='Crack')
+        plt.plot([a[0],b[0]],[a[1],b[1]], 'w--', lw=0.5, label='Crack')
     ax.set_aspect('equal', adjustable='box')
     plt.xlabel('x (m)'); plt.ylabel('y (m)'); plt.title(title)
     plt.legend(loc='best'); plt.tight_layout()
 
-def plot_graph_and_path(coords, efrom, eto, path_nodes, title=''):
-    segs = np.stack([coords[efrom], coords[eto]], axis=1)
-    lc = LineCollection(segs, colors=(0.85,0.85,0.85,1.0), linewidths=0.3)
-    plt.figure(figsize=(7.5,6)); ax=plt.gca()
-    ax.add_collection(lc); ax.autoscale()
-    if path_nodes and len(path_nodes)>0:
-        c = coords[path_nodes]
-        plt.plot(c[:,0], c[:,1], 'm-', lw=3, label='Dijkstra shortest time')
-    ax.set_aspect('equal', adjustable='box')
-    plt.title(title); plt.xlabel('x (m)'); plt.ylabel('y (m)'); plt.legend(loc='best'); plt.tight_layout()
+    plt.tight_layout(); plt.savefig("tracemap.png", dpi=220)
+    plt.close()
+    print("Saved tracemap: tracemap.png")
 
 # -------------------------- CASES --------------------------
-
-
 
 def showconductance(coords,efrom,eto,M_jam,off,i,save_prefix,show):
     # Conductance visualization (no interpolation): scatter edge midpoints colored by G
@@ -769,7 +512,6 @@ def showbjmesh(coords,bj,off,i,save_prefix,show,title,figname):
     #plt.title(f'bj RHS after Dirichlet (offset {off:.2f}×lp0)')
     plt.title(title)
     plt.xlabel('x (m)'); plt.ylabel('y (m)')
-    #bj_png = f"{save_prefix}_{i}_bj.png"
     bj_png = f"{save_prefix}_{i}_{figname}"
     plt.tight_layout(); plt.savefig(bj_png, dpi=220)
     if not show:
@@ -819,18 +561,22 @@ def case_square_with_vertical_conductive_strip(save_prefix=None, show=False, see
         el = np.linalg.norm(p1 - p0)
         t0 = el / max(speed, 1e-9)
         G0 = 1.0 / max(t0, 1e-12)
+        # print("mph:", mph, " speed:", speed, " el:", el, " t0:", t0, " G0:", G0)
+        # exit()
 
         mid = 0.5 * (p0 + p1)
         gain = gain_gamma if in_strip(mid[0], mid[1]) else 1.0
-        G = G0 * gain; t = t0 / gain
+        G = G0 * gain; 
+        t = t0 / gain
 
         rows += [u, v, u, v]; cols += [u, v, v, u]; data += [G, G, -G, -G]
         efrom.append(u); eto.append(v); etime.append(t); K_edge.append(G)
-        time_map[(u, v)] = t; time_map[(v, u)] = t
+        time_map[(u, v)] = t
+        time_map[(v, u)] = t
 
     M = sparse.csr_matrix((np.array(data, float),
-                           (np.array(rows, int), np.array(cols, int))),
-                          shape=(coords.shape[0], coords.shape[0]))
+                        (np.array(rows, int), np.array(cols, int))),
+                        shape=(coords.shape[0], coords.shape[0]))
     efrom = np.array(efrom, int); eto = np.array(eto, int)
     etime = np.array(etime, float); K_edge = np.array(K_edge, float)
 
@@ -844,53 +590,45 @@ def case_square_with_vertical_conductive_strip(save_prefix=None, show=False, see
     phi = solve_with_component_pinning(ML, b, pinned_nodes=np.r_[left_nodes, right_nodes])
 
     # Scale to Q_total = 1000 vehicles through the left plate
-    phi, alpha = scale_phi_to_total_flow(phi, coords, efrom, eto, time_map, left_nodes, Q_target=1000.0)
-
-    kxx, kxy, kyy = singum_tensor_per_node(coords, efrom, eto, K_edge, lattice='square', lp0=lp0)
-    qx_node, qy_node = singum_flow_per_node(coords, phi, efrom, eto, time_map, lattice='square', lp0=lp0)
+    #phi, alpha = scale_phi_to_total_flow(phi, coords, efrom, eto, time_map, left_nodes, Q_target=1000.0)
 
     ng = 260
-    xg = np.linspace(0, L, ng); yg = np.linspace(0, W, ng)
+    xg = np.linspace(0, L, ng)
+    yg = np.linspace(0, W, ng)
     X, Y = np.meshgrid(xg, yg)
     Phi = griddata(coords, phi, (X, Y), method='linear')
-    Phi = nan_gaussian_blur(Phi, 0.8)
-    dPhidy, dPhidx = np.gradient(Phi, yg[1]-yg[0], xg[1]-xg[0], edge_order=2)
+    # Phi = nan_gaussian_blur(Phi, 0.8)
+    delx = xg[1]-xg[0]
+    dely = yg[1]-yg[0]
+    dPhidy, dPhidx = np.gradient(Phi, dely, delx, edge_order=2)
+    gradx_interp = RegularGridInterpolator((yg, xg), dPhidx, method='quintic', bounds_error=False, fill_value=0.0)
+    grady_interp = RegularGridInterpolator((yg, xg), dPhidy, method='quintic', bounds_error=False, fill_value=0.0)
 
-    src = nearest_node(coords, (0.0+10*lp0, W/2))
-    dst = nearest_node(coords, (L-10*lp0,   W/2))
-    greedy_nodes, greedy_xy = continuous_gradient_path(phi, coords, src, dst)
+    conductivity_grid = time_map_to_conductivity_mesh(time_map, coords, efrom, eto, xg, yg)
+    src_phy = (0.0 + 10*lp0, W/2)
+    dst_phy = (L - 10*lp0,   W/2)
+    src = nearest_node(coords, src_phy)
+    dst = nearest_node(coords, dst_phy)
+
     dijk_nodes, dijk_time = dijkstra_path(coords, efrom, eto, etime, src, dst)
-    greedy_time           = path_time(greedy_nodes, time_map)
-    ov                    = path_overlap(greedy_nodes, dijk_nodes)
 
+    greedy_xy = gradienttrace(gradx_interp,grady_interp, coords, src, dst, xg, yg, steplength=steplen)
+    greedy_time = path_time_from_mesh(greedy_xy, conductivity_grid, xg, yg, steplength=steplen)
+
+    # greedy_time           = path_time(greedy_nodes, time_map)
+
+    print(f'Dijkstra time: {dijk_time:.4f} s, Greedy time on mesh: {greedy_time:.4f} s')
     title = f'Square lattice with vertical conductive strip'
     hole_rect = (strip_xc, 0.5*(strip_y0+strip_y1), strip_w, (strip_y1-strip_y0))  # visual only
 
     plot_field_with_paths(
         X, Y, Phi, dPhidx, dPhidy, coords, src, dst,
-        greedy_coords=greedy_xy if len(greedy_nodes) else None,
+        greedy_coords=greedy_xy,
         dijk_coords=coords[dijk_nodes] if dijk_nodes else None,
         electrodes=None,
         hole_rect=hole_rect,
-        title=title
-    )
-
-    if save_prefix:
-        plt.savefig(f'{save_prefix}_field.png', dpi=220)
-        plt.figure(2); plt.savefig(f'{save_prefix}_graph.png', dpi=220)
-    if show:
-        plt.show()
-
-    return dict(
-        gamma=gain_gamma, alpha=alpha,
-        strip_center_x=strip_xc, strip_width=strip_w, strip_y_span=(strip_y0, strip_y1),
-        greedy_time=float(greedy_time), dijkstra_time=float(dijk_time), overlap=float(ov)
-    )
+        title=title)
 
 if __name__ == "__main__":
-    #case_hex_with_disks(show=False, seed=42)
-    #case_square_with_hole(show=False, seed=43)
-    case_square_with_vertical_conductive_strip(show=False, seed=44)
-
-    #case_hex_with_jam_offsets(show=False)
+    case_square_with_vertical_conductive_strip(save_prefix=None, show=False, seed=44)
     plt.show()
