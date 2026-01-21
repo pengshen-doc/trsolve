@@ -361,7 +361,7 @@ def path_time_from_mesh(path_coords, conductivity_grid, xg, yg, steplength=1e-4)
     Returns:
         Total travel time along the path (sum of segment times)
     """
-    from scipy.interpolate import RegularGridInterpolator
+    # from scipy.interpolate import RegularGridInterpolator
     
     if len(path_coords) < 2:
         print("path_time_from_mesh: path too short")
@@ -614,8 +614,6 @@ def case_square_with_vertical_conductive_strip(save_prefix=None, show=False, see
 
     greedy_xy = gradienttrace(gradx_interp,grady_interp, coords, src, dst, steplength=steplen)
     greedy_time = path_time_from_mesh(greedy_xy, conductivity_grid, xg, yg, steplength=steplen)
-
-    # greedy_time           = path_time(greedy_nodes, time_map)
 
     print(f'Dijkstra time: {dijk_time:.4f} s, Greedy time on mesh: {greedy_time:.4f} s')
     title = f'Square lattice with vertical conductive strip'
